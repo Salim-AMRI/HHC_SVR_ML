@@ -1,0 +1,631 @@
+"""
+=============================================================================
+PHASE 1 BENCHMARK
+=============================================================================
+- Pré‑calcul des distances (matrice N×N)
+- Solutions sous forme de tuples immuables → hashable pour tabu list
+- Réparation LÉGÈRE (sans NN/2‑opt) dans _generate_neighbors()
+- Réparation complète (avec NN/2‑opt) sur solution initiale et finale
+- Protection finale : si post_cost > pre_cost, on garde la solution initiale
+- Affichage des écarts‑types dans les résultats
+=============================================================================
+CONFIGURATION
+=============================================================================
+
+INSTANCES = [
+    {"name": "X-n101-k25", "capacity": 206, "num_vehicles": 25},
+    {"name": "X-n106-k14", "capacity": 53,  "num_vehicles": 14},
+    {"name": "X-n110-k13", "capacity": 66,  "num_vehicles": 13},
+    {"name": "X-n115-k10", "capacity": 125, "num_vehicles": 10},
+    {"name": "X-n120-k6",  "capacity": 700, "num_vehicles": 6},
+    {"name": "X-n125-k30", "capacity": 55,  "num_vehicles": 30},
+    {"name": "X-n129-k18", "capacity": 240, "num_vehicles": 18},
+    {"name": "X-n134-k13", "capacity": 150, "num_vehicles": 13},
+    {"name": "X-n139-k10", "capacity": 265, "num_vehicles": 10},
+    {"name": "X-n143-k7",  "capacity": 714, "num_vehicles": 7},
+    {"name": "X-n148-k46", "capacity": 52,  "num_vehicles": 46},
+]
+"""
+
+import numpy as np
+import time
+import random
+import csv
+import os
+from copy import deepcopy
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Liste complète (décommenter pour l'expérience complète)
+INSTANCES = [
+    {"name": "X-n143-k7",  "capacity": 714, "num_vehicles": 7},
+]
+
+METHODS      = ['kmeans', 'dbscan', 'gmm', 'random']
+N_RUNS       = 30
+MAX_TIME     = 120          # secondes (ajustez selon vos besoins)
+TABU_TENURE  = 10
+INSTANCE_DIR = "."   # dossier contenant les .vrp (adaptez)
+OUTPUT_CSV   = "phase10_results.csv"
+SEEDS = list(range(42, 42 + N_RUNS))
+
+
+# =============================================================================
+# FONCTIONS UTILITAIRES (chargement, distances)
+# =============================================================================
+
+def load_instance(filepath):
+    with open(filepath, 'r') as f:
+        lines = f.read().split('\n')
+    dimension = None
+    for line in lines:
+        if 'DIMENSION' in line:
+            try:
+                dimension = int(line.split(':')[-1].strip())
+            except:
+                pass
+            break
+    if dimension is None:
+        dimension = 0
+    coords = []
+    demands = [0]  # depot
+    node_section = False
+    demand_section = False
+    for line in lines:
+        line = line.strip()
+        if 'NODE_COORD_SECTION' in line:
+            node_section = True
+            demand_section = False
+            continue
+        if 'DEMAND_SECTION' in line:
+            node_section = False
+            demand_section = True
+            continue
+        if 'EOF' in line:
+            break
+        if node_section and line:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    coords.append((float(parts[1]), float(parts[2])))
+                except:
+                    pass
+        if demand_section and line:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    demands.append(int(parts[1]))
+                except:
+                    pass
+    if dimension == 0:
+        dimension = len(coords)
+    while len(demands) < dimension + 1:
+        demands.append(0)
+    demands = demands[:dimension+1]
+    if len(coords) != dimension:
+        min_dim = min(len(coords), dimension)
+        coords = coords[:min_dim]
+        dimension = min_dim
+        demands = demands[:dimension+1]
+    return coords, demands, dimension
+
+def precompute_distances(coords):
+    n = len(coords)
+    dist = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(coords[i][0] - coords[j][0], coords[i][1] - coords[j][1])
+            dist[i, j] = d
+            dist[j, i] = d
+    return dist
+
+def route_distance(route, dist):
+    if not route:
+        return 0.0
+    d = dist[0, route[0]]
+    for i in range(len(route)-1):
+        d += dist[route[i], route[i+1]]
+    d += dist[route[-1], 0]
+    return d
+
+def total_distance(solution, dist):
+    return sum(route_distance(r, dist) for r in solution)
+
+
+# =============================================================================
+# CLASSE SOLVER OPTIMISÉE (AVEC CORRECTION)
+# =============================================================================
+
+class CVRPSolverOptimized:
+    def __init__(self, coords, demands, dimension, capacity,
+                 num_vehicles, max_time, tabu_tenure,
+                 init_method='kmeans', seed=42):
+        self.coords = coords
+        self.demands = demands
+        self.dimension = dimension
+        self.capacity = capacity
+        self.num_vehicles = num_vehicles
+        self.max_time = max_time
+        self.tabu_tenure = tabu_tenure
+        self.init_method = init_method
+        self.seed = seed
+
+        np.random.seed(seed)
+        random.seed(seed)
+        self.dist = precompute_distances(coords)
+
+        self.best_feasible = None
+        self.best_feasible_cost = float('inf')
+        self.best_feasible_time = 0.0
+
+        # Solution initiale (brute + repair complet)
+        self.solution = self._init_solution()
+        self.solution = self._repair_capacity(self.solution)   # repair complet (NN+2-opt)
+        self.initial_solution = self._freeze_solution(self.solution)
+        self.pre_ts_cost = total_distance(self.solution, self.dist)
+
+    # -------------------------------------------------------------------------
+    # Conversion solution <-> tuple (hashable)
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _freeze_solution(solution):
+        return tuple(tuple(route) for route in solution)
+
+    @staticmethod
+    def _unfreeze_solution(frozen):
+        return [list(route) for route in frozen]
+
+    def _total_distance(self, solution):
+        return total_distance(solution, self.dist)
+
+    # -------------------------------------------------------------------------
+    # Réparation COMPLÈTE (avec NN + 2-opt) – utilisée peu souvent
+    # -------------------------------------------------------------------------
+    def _repair_capacity(self, solution):
+        """Rend la solution faisable et réordonne chaque route (NN puis 2-opt)."""
+        solution = [route[:] for route in solution]
+        loads = [sum(self.demands[c] for c in r) for r in solution]
+        for _ in range(100):
+            any_over = False
+            for i, route in enumerate(solution):
+                if loads[i] <= self.capacity:
+                    continue
+                any_over = True
+                sorted_clients = sorted(route, key=lambda c: self.demands[c], reverse=True)
+                for client in sorted_clients:
+                    if loads[i] <= self.capacity:
+                        break
+                    moved = False
+                    for j, other in enumerate(solution):
+                        if i == j:
+                            continue
+                        if loads[j] + self.demands[client] <= self.capacity:
+                            route.remove(client)
+                            other.append(client)
+                            loads[i] -= self.demands[client]
+                            loads[j] += self.demands[client]
+                            moved = True
+                            break
+                    if not moved:
+                        j = min(range(len(solution)), key=lambda idx: loads[idx])
+                        route.remove(client)
+                        solution[j].append(client)
+                        loads[i] -= self.demands[client]
+                        loads[j] += self.demands[client]
+            if not any_over:
+                break
+        # Réordonner chaque route (NN + 2-opt)
+        for i, route in enumerate(solution):
+            if route:
+                solution[i] = self._order_nn(route)
+                solution[i] = self._improve_2opt(solution[i])
+        return solution
+
+    # -------------------------------------------------------------------------
+    # Réparation LÉGÈRE (sans réordonnancement) – utilisée dans le voisinage
+    # -------------------------------------------------------------------------
+    def _repair_capacity_fast(self, solution):
+        """Déplace les clients pour respecter les capacités, sans réordonner."""
+        solution = [route[:] for route in solution]
+        loads = [sum(self.demands[c] for c in r) for r in solution]
+        for _ in range(50):
+            any_over = False
+            for i, route in enumerate(solution):
+                if loads[i] <= self.capacity:
+                    continue
+                any_over = True
+                # Trier par demande décroissante pour déplacer les plus lourds d'abord
+                for client in sorted(route, key=lambda c: self.demands[c], reverse=True):
+                    if loads[i] <= self.capacity:
+                        break
+                    for j in range(len(solution)):
+                        if i == j:
+                            continue
+                        if loads[j] + self.demands[client] <= self.capacity:
+                            route.remove(client)
+                            solution[j].append(client)
+                            loads[i] -= self.demands[client]
+                            loads[j] += self.demands[client]
+                            break
+            if not any_over:
+                break
+        return solution
+
+    # -------------------------------------------------------------------------
+    # Initialisations (KMeans, DBSCAN, GMM, Random)
+    # -------------------------------------------------------------------------
+    def _init_solution(self):
+        if self.init_method == 'kmeans':
+            return self._init_kmeans()
+        elif self.init_method == 'dbscan':
+            return self._init_dbscan()
+        elif self.init_method == 'gmm':
+            return self._init_gmm()
+        else:
+            return self._init_random()
+
+    def _assign_and_order(self, clusters_list):
+        while len(clusters_list) > self.num_vehicles:
+            clusters_list = sorted(clusters_list, key=lambda x: x[0] if x else 0)
+            extra = clusters_list.pop()
+            lightest = min(clusters_list, key=lambda r: sum(self.demands[c] for c in r))
+            lightest.extend(extra)
+        while len(clusters_list) < self.num_vehicles:
+            clusters_list.append([])
+        solution = clusters_list[:self.num_vehicles]
+        for i, route in enumerate(solution):
+            if route:
+                solution[i] = self._order_nn(route)
+                solution[i] = self._improve_2opt(solution[i])
+        return solution
+
+    def _init_kmeans(self):
+        clients = np.array(self.coords[1:])
+        km = KMeans(n_clusters=self.num_vehicles, random_state=self.seed, n_init=10).fit(clients)
+        clusters = [[] for _ in range(self.num_vehicles)]
+        for idx, label in enumerate(km.labels_):
+            clusters[label].append(idx+1)
+        return self._assign_and_order(clusters)
+
+    def _init_dbscan(self):
+        clients = np.array(self.coords[1:])
+        n = len(clients)
+        eps = max(0.5, np.percentile(
+            [np.min([np.linalg.norm(clients[i] - clients[j]) for j in range(n) if j != i])
+             for i in range(min(n, 50))], 50) * 2)
+        db = DBSCAN(eps=eps, min_samples=3).fit(clients)
+        labels = db.labels_
+        clusters = {}
+        for idx, lbl in enumerate(labels):
+            cid = idx+1
+            if lbl == -1:
+                continue
+            clusters.setdefault(lbl, []).append(cid)
+        noise_idx = np.where(labels == -1)[0]
+        if clusters:
+            centers = {lbl: np.mean([clients[c-1] for c in cids], axis=0) for lbl, cids in clusters.items()}
+            for idx in noise_idx:
+                pt = clients[idx]
+                best_lbl = min(centers, key=lambda l: np.linalg.norm(pt - centers[l]))
+                clusters[best_lbl].append(idx+1)
+        else:
+            clusters[0] = list(range(1, self.dimension))
+        assigned = set(c for cids in clusters.values() for c in cids)
+        missing = set(range(1, self.dimension)) - assigned
+        if missing:
+            first_key = next(iter(clusters))
+            clusters[first_key].extend(missing)
+        return self._assign_and_order(list(clusters.values()))
+
+    def _init_gmm(self):
+        clients = np.array(self.coords[1:])
+        gmm = GaussianMixture(n_components=self.num_vehicles, random_state=self.seed, covariance_type='full').fit(clients)
+        labels = gmm.predict(clients)
+        clusters = [[] for _ in range(self.num_vehicles)]
+        for idx, lbl in enumerate(labels):
+            clusters[lbl].append(idx+1)
+        return self._assign_and_order(clusters)
+
+    def _init_random(self):
+        clients = list(range(1, self.dimension))
+        np.random.shuffle(clients)
+        clusters = [[] for _ in range(self.num_vehicles)]
+        for i, c in enumerate(clients):
+            clusters[i % self.num_vehicles].append(c)
+        return self._assign_and_order(clusters)
+
+    # -------------------------------------------------------------------------
+    # Ordre NN et 2-opt (utilisés dans _repair_capacity et init)
+    # -------------------------------------------------------------------------
+    def _order_nn(self, route):
+        current = 0
+        ordered = []
+        unvisited = set(route)
+        while unvisited:
+            nxt = min(unvisited, key=lambda x: self.dist[current, x])
+            ordered.append(nxt)
+            unvisited.remove(nxt)
+            current = nxt
+        return ordered
+
+    def _improve_2opt(self, route):
+        best = route[:]
+        best_d = route_distance(best, self.dist)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(1, len(best)-1):
+                for j in range(i+1, len(best)):
+                    if j - i == 1:
+                        continue
+                    new = best[:i] + best[i:j][::-1] + best[j:]
+                    nd = route_distance(new, self.dist)
+                    if nd < best_d:
+                        best, best_d, improved = new, nd, True
+        return best
+
+    # -------------------------------------------------------------------------
+    # Voisinage avec réparation LÉGÈRE (sans réordonnancement)
+    # -------------------------------------------------------------------------
+    def _generate_neighbors(self, solution):
+        """Génère des voisins faisables en utilisant _repair_capacity_fast."""
+        neighbors = []
+        sol_list = [list(route) for route in solution]
+
+        # 1) Swap inter‑routes
+        for i in range(len(sol_list)):
+            for j in range(i+1, len(sol_list)):
+                if sol_list[i] and sol_list[j]:
+                    for ki in range(len(sol_list[i])):
+                        for kj in range(len(sol_list[j])):
+                            nb = [r[:] for r in sol_list]
+                            nb[i][ki], nb[j][kj] = nb[j][kj], nb[i][ki]
+                            nb = self._repair_capacity_fast(nb)   # ← repair léger
+                            neighbors.append(self._freeze_solution(nb))
+
+        # 2) Relocate
+        for src in range(len(sol_list)):
+            for dst in range(len(sol_list)):
+                if src != dst and sol_list[src]:
+                    for idx in range(len(sol_list[src])):
+                        nb = [r[:] for r in sol_list]
+                        client = nb[src].pop(idx)
+                        # Meilleure insertion dans la route destination (évaluation rapide)
+                        best_pos = 0
+                        best_inc = float('inf')
+                        route_dst = nb[dst]
+                        for pos in range(len(route_dst)+1):
+                            tmp = route_dst[:pos] + [client] + route_dst[pos:]
+                            inc = route_distance(tmp, self.dist) - route_distance(route_dst, self.dist)
+                            if inc < best_inc:
+                                best_inc, best_pos = inc, pos
+                        nb[dst].insert(best_pos, client)
+                        nb = self._repair_capacity_fast(nb)   # ← repair léger
+                        neighbors.append(self._freeze_solution(nb))
+
+        # 3) 2‑opt intra‑route
+        for r in range(len(sol_list)):
+            route = sol_list[r]
+            if len(route) >= 4:
+                for i in range(1, len(route)-2):
+                    for j in range(i+2, len(route)):
+                        nb = [r[:] for r in sol_list]
+                        nb[r][i:j+1] = nb[r][i:j+1][::-1]
+                        nb = self._repair_capacity_fast(nb)   # ← repair léger
+                        neighbors.append(self._freeze_solution(nb))
+
+        return neighbors
+
+    # -------------------------------------------------------------------------
+    # Tabu Search (avec les voisins générés ci-dessus)
+    # -------------------------------------------------------------------------
+    def tabu_search(self):
+        start = time.time()
+        current = self._freeze_solution(self.solution)
+        best_sol = current
+        best_cost = self._total_distance(self._unfreeze_solution(best_sol))
+        tabu_set = set()
+        tabu_queue = []
+        iterations = 0
+
+        while time.time() - start < self.max_time:
+            iterations += 1
+            neighbors = self._generate_neighbors(self._unfreeze_solution(current))
+            if not neighbors:
+                break
+
+            best_nb = None
+            best_nb_cost = float('inf')
+            for nb in neighbors:
+                nb_sol = self._unfreeze_solution(nb)
+                nb_cost = self._total_distance(nb_sol)
+                if nb in tabu_set and nb_cost >= best_cost:
+                    continue
+                if nb_cost < best_nb_cost:
+                    best_nb_cost = nb_cost
+                    best_nb = nb
+
+            if best_nb is None:
+                break
+
+            elapsed = time.time() - start
+            if best_nb_cost < best_cost:
+                best_sol = best_nb
+                best_cost = best_nb_cost
+                if self._is_feasible(self._unfreeze_solution(best_nb)):
+                    self.best_feasible = best_nb
+                    self.best_feasible_cost = best_nb_cost
+                    self.best_feasible_time = elapsed
+
+            tabu_set.add(current)
+            tabu_queue.append(current)
+            if len(tabu_queue) > self.tabu_tenure:
+                removed = tabu_queue.pop(0)
+                tabu_set.discard(removed)
+
+            current = best_nb
+
+            if iterations % 50 == 0:
+                print(f"Iter {iterations} | Coût: {best_nb_cost:.0f} | Temps: {elapsed:.1f}s")
+
+        # Réparation COMPLÈTE sur la meilleure solution trouvée (pour garantir l'ordre)
+        final_candidate = self.best_feasible if self.best_feasible is not None else best_sol
+        final_sol = self._unfreeze_solution(final_candidate)
+        # On répare complètement (avec réordonnancement) pour être sûr de la qualité
+        final_sol = self._repair_capacity(final_sol)
+        if self._total_distance(final_sol) > self.pre_ts_cost:
+            final_sol = self._unfreeze_solution(self.initial_solution)
+        return final_sol
+
+    # -------------------------------------------------------------------------
+    # Vérifications
+    # -------------------------------------------------------------------------
+    def _is_feasible(self, solution):
+        for route in solution:
+            if sum(self.demands[c] for c in route) > self.capacity:
+                return False
+        return True
+
+    def _validate(self, solution):
+        expected = set(range(1, self.dimension))
+        present = set(c for r in solution for c in r)
+        return expected == present
+
+
+# =============================================================================
+# BOUCLE PRINCIPALE (identique à v3, mais utilise la classe corrigée)
+# =============================================================================
+
+def run_benchmark():
+    fieldnames = [
+        'instance', 'method', 'run', 'seed',
+        'pre_ts_cost', 'post_ts_cost', 'post_ts_time_s',
+        'feasible', 'valid', 'improvement_pct'
+    ]
+    with open(OUTPUT_CSV, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+    instance_cache = {}
+    for inst_cfg in INSTANCES:
+        file_path = os.path.join(INSTANCE_DIR, f"{inst_cfg['name']}.vrp")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Fichier introuvable : {file_path}")
+        coords, demands, dimension = load_instance(file_path)
+        instance_cache[inst_cfg['name']] = (coords, demands, dimension)
+        print(f"Instance {inst_cfg['name']} chargée : {dimension} clients")
+
+    total_runs = len(INSTANCES) * len(METHODS) * N_RUNS
+    run_counter = 0
+
+    for inst_cfg in INSTANCES:
+        inst_name = inst_cfg['name']
+        coords, demands, dimension = instance_cache[inst_name]
+        for method in METHODS:
+            print(f"\nMéthode {method.upper()} sur {inst_name}")
+            method_results = []
+            for seed in SEEDS:
+                run_counter += 1
+                print(f"  Run {run_counter:3d}/{total_runs} (seed={seed})", end=' ', flush=True)
+                solver = CVRPSolverOptimized(
+                    coords=coords, demands=demands, dimension=dimension,
+                    capacity=inst_cfg['capacity'],
+                    num_vehicles=inst_cfg['num_vehicles'],
+                    max_time=MAX_TIME,
+                    tabu_tenure=TABU_TENURE,
+                    init_method=method,
+                    seed=seed,
+                )
+                pre_cost = solver.pre_ts_cost
+                ts_start = time.time()
+                final_sol = solver.tabu_search()
+                ts_time = time.time() - ts_start
+                post_cost = total_distance(final_sol, solver.dist)
+                feasible = int(solver._is_feasible(final_sol))
+                valid = int(solver._validate(final_sol))
+                impr_pct = (pre_cost - post_cost) / pre_cost * 100 if pre_cost > 0 else 0.0
+                print(f"→ pre={pre_cost:.0f} post={post_cost:.0f} Δ={impr_pct:+.1f}%")
+                row = {
+                    'instance': inst_name,
+                    'method': method,
+                    'run': run_counter,
+                    'seed': seed,
+                    'pre_ts_cost': round(pre_cost, 2),
+                    'post_ts_cost': round(post_cost, 2),
+                    'post_ts_time_s': round(solver.best_feasible_time if solver.best_feasible is not None else ts_time, 2),
+                    'feasible': feasible,
+                    'valid': valid,
+                    'improvement_pct': round(impr_pct, 2),
+                }
+                method_results.append(row)
+                with open(OUTPUT_CSV, 'a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writerow(row)
+            pre_costs = [r['pre_ts_cost'] for r in method_results]
+            post_costs = [r['post_ts_cost'] for r in method_results]
+            print(f"  Résumé {inst_name} {method}: pre avg={np.mean(pre_costs):.0f} ± {np.std(pre_costs):.0f}, "
+                  f"post avg={np.mean(post_costs):.0f} ± {np.std(post_costs):.0f}")
+
+    print(f"\nBenchmark terminé. Résultats dans {OUTPUT_CSV}")
+
+
+def analyse_results(csv_path=OUTPUT_CSV):
+    from collections import defaultdict
+    data = defaultdict(list)
+    with open(csv_path, newline='') as f:
+        for row in csv.DictReader(f):
+            key = (row['instance'], row['method'])
+            data[key].append({
+                'pre': float(row['pre_ts_cost']),
+                'post': float(row['post_ts_cost']),
+            })
+    methods = METHODS
+    instances = [i['name'] for i in INSTANCES]
+    print("\n" + "="*80)
+    print("TABLE PRÉ-TS (moyenne ± écart-type)")
+    print("="*80)
+    header = f"{'Instance':<18}" + "".join(f"{m.upper():>20}" for m in methods)
+    print(header)
+    for inst in instances:
+        row_str = f"{inst:<18}"
+        for m in methods:
+            vals = [d['pre'] for d in data[(inst, m)]]
+            mean = np.mean(vals)
+            std = np.std(vals)
+            row_str += f"{mean:>12.0f} ±{std:>6.0f}"
+        print(row_str)
+    print("\n" + "="*80)
+    print("TABLE POST-TS (moyenne ± écart-type)")
+    print("="*80)
+    print(header)
+    for inst in instances:
+        row_str = f"{inst:<18}"
+        for m in methods:
+            vals = [d['post'] for d in data[(inst, m)]]
+            mean = np.mean(vals)
+            std = np.std(vals)
+            row_str += f"{mean:>12.0f} ±{std:>6.0f}"
+        print(row_str)
+    print("\n" + "="*80)
+    print("AMÉLIORATION PRÉ→POST (%)")
+    print("="*80)
+    header2 = f"{'Instance':<18}" + "".join(f"{m.upper():>12}" for m in methods)
+    print(header2)
+    for inst in instances:
+        row_str = f"{inst:<18}"
+        for m in methods:
+            pre_vals = [d['pre'] for d in data[(inst, m)]]
+            post_vals = [d['post'] for d in data[(inst, m)]]
+            impr = (np.mean(pre_vals) - np.mean(post_vals)) / np.mean(pre_vals) * 100
+            row_str += f"{impr:>11.1f}%"
+        print(row_str)
+
+
+if __name__ == '__main__':
+    run_benchmark()
+    if os.path.exists(OUTPUT_CSV):
+        analyse_results(OUTPUT_CSV)
