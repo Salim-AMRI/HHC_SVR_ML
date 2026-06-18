@@ -1,0 +1,901 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+PHASE 1 + PHASE 2 – COMPARAISON DES MÉTHODES D'INSERTION
+- Tabu Search opère uniquement sur l'espace faisable (vérification capacité stricte)
+- Insertion aléatoire vraiment aléatoire
+- Méthodes ML vérifient la capacité avant insertion, fallback pénalisé si nécessaire
+- Solution finale garantie faisable
+- Analyse des résultats corrigée (moyennes sur tous les runs)
+"""
+
+import numpy as np
+import time
+import csv
+import os
+import random
+import re
+from collections import defaultdict
+from copy import deepcopy
+from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+import xgboost as xgb
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+INSTANCE_FILES = [
+    "X-n101-k25.vrp",
+    "X-n106-k14.vrp",
+    "X-n110-k13.vrp",
+    "X-n115-k10.vrp",
+    "X-n120-k6.vrp",
+    "X-n125-k30.vrp",
+    "X-n129-k18.vrp",
+    "X-n134-k13.vrp",
+    "X-n139-k10.vrp",
+    "X-n143-k7.vrp",
+    "X-n148-k46.vrp",
+]
+
+INSTANCE_DIR     = "."          # dossier contenant les .vrp
+N_RUNS           = 30           # nombre de runs (mettre 2 pour test)
+MAX_TIME_TABU    = 60           # secondes pour chaque phase Tabu
+PENALTY_FACTOR   = 1000         # pour fallback insertion (pas utilisé dans Tabu)
+KNN_K            = 5
+OUTPUT_CSV       = "comparaison_insertion_9_1.csv"
+SEEDS            = list(range(42, 42 + N_RUNS))
+
+INSERTION_METHODS = [
+    ("random",            "Random"),
+    ("cheapest",          "Cheapest"),
+    ("regret2",           "Regret-2"),
+    ("regret3",           "Regret-3"),
+    ("knn",               "k-NN"),
+    ("svm",               "SVM"),
+    ("kmeans_classifier", "KMeans Classifier"),
+    ("random_forest",     "Random Forest"),
+    ("gradient_boosting", "Gradient Boosting"),
+]
+
+# =============================================================================
+# CHARGEMENT DES INSTANCES
+# =============================================================================
+
+def load_instance(filepath):
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    cap_match = re.search(r'CAPACITY\s*:\s*(\d+)', content)
+    if cap_match:
+        capacity = int(cap_match.group(1))
+    else:
+        raise ValueError(f"Capacité non trouvée dans {filepath}")
+
+    filename = os.path.basename(filepath)
+    k_match = re.search(r'-k(\d+)', filename)
+    if k_match:
+        num_vehicles = int(k_match.group(1))
+    else:
+        raise ValueError(f"K non trouvé dans {filename}")
+
+    coord_match = re.search(r'NODE_COORD_SECTION(.*?)DEMAND_SECTION', content, re.DOTALL)
+    coords = []
+    if coord_match:
+        for line in coord_match.group(1).strip().split('\n'):
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                try:
+                    coords.append((float(parts[1]), float(parts[2])))
+                except:
+                    pass
+    else:
+        raise ValueError("Section NODE_COORD_SECTION non trouvée")
+
+    demand_match = re.search(r'DEMAND_SECTION(.*?)(?:DEPOT_SECTION|EOF)', content, re.DOTALL)
+    demands = [0]
+    if demand_match:
+        for line in demand_match.group(1).strip().split('\n'):
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                try:
+                    demands.append(int(parts[1]))
+                except:
+                    pass
+    else:
+        raise ValueError("Section DEMAND_SECTION non trouvée")
+
+    dim = len(coords)
+    while len(demands) < dim + 1:
+        demands.append(0)
+    demands = demands[:dim+1]
+    demands[0] = 0
+    return coords, demands, dim, capacity, num_vehicles
+
+def precompute_distances(coords):
+    n = len(coords)
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(coords[i][0]-coords[j][0], coords[i][1]-coords[j][1])
+            D[i,j] = D[j,i] = d
+    return D
+
+def route_dist(route, D):
+    if not route:
+        return 0.0
+    d = D[0, route[0]]
+    for i in range(len(route)-1):
+        d += D[route[i], route[i+1]]
+    d += D[route[-1], 0]
+    return d
+
+def total_dist(sol, D):
+    return sum(route_dist(r, D) for r in sol)
+
+def is_feasible(sol, demands, cap):
+    return all(sum(demands[c] for c in r) <= cap for r in sol)
+
+# =============================================================================
+# SOLVER TABU (espace strictement faisable)
+# =============================================================================
+
+class TabuSolver:
+    def __init__(self, coords, demands, D, capacity, num_vehicles, max_time, seed=42):
+        self.coords = coords
+        self.demands = demands
+        self.D = D
+        self.capacity = capacity
+        self.num_vehicles = num_vehicles
+        self.max_time = max_time
+        self.seed = seed
+        np.random.seed(seed)
+        random.seed(seed)
+        self.solution = None
+        self.initial_solution = None
+        self.pre_ts_cost = None
+
+    def set_initial_solution(self, routes):
+        self.solution = [r[:] for r in routes]
+        self.initial_solution = self._freeze(self.solution)
+        self.pre_ts_cost = total_dist(self.solution, self.D)
+
+    @staticmethod
+    def _freeze(sol): return tuple(tuple(r) for r in sol)
+    @staticmethod
+    def _unfreeze(frozen): return [list(r) for r in frozen]
+
+    def _is_feasible(self, sol):
+        return all(sum(self.demands[c] for c in r) <= self.capacity for r in sol)
+
+    # -------------------- Ordre et 2-opt --------------------
+    def _nn_order(self, route):
+        cur, ordered, unvis = 0, [], set(route)
+        while unvis:
+            nxt = min(unvis, key=lambda x: self.D[cur, x])
+            ordered.append(nxt); unvis.remove(nxt); cur = nxt
+        return ordered
+
+    def _two_opt(self, route):
+        best = route[:]; bd = route_dist(best, self.D); improved = True
+        max_iter = 50; it = 0
+        while improved and it < max_iter:
+            improved = False; it += 1
+            for i in range(1, len(best)-1):
+                for j in range(i+1, len(best)):
+                    if j-i == 1: continue
+                    new = best[:i] + best[i:j][::-1] + best[j:]
+                    nd = route_dist(new, self.D)
+                    if nd < bd: best, bd, improved = new, nd, True
+        return best
+
+    def _repair_full(self, sol):
+        """Réparation complète + réordonnancement (fallback)."""
+        s = [r[:] for r in sol]
+        loads = [sum(self.demands[c] for c in r) for r in s]
+        for _ in range(100):
+            over = next((i for i, l in enumerate(loads) if l > self.capacity), None)
+            if over is None: break
+            client = max(s[over], key=lambda c: self.demands[c])
+            target = min(range(len(s)), key=lambda i: loads[i])
+            s[over].remove(client); s[target].append(client)
+            loads[over] -= self.demands[client]; loads[target] += self.demands[client]
+        for i, r in enumerate(s):
+            if r: s[i] = self._two_opt(self._nn_order(r))
+        return s
+
+    def _force_feasible_strict(self, sol):
+        """First Fit Decreasing – garantit faisabilité."""
+        all_clients = [c for r in sol for c in r]
+        all_clients.sort(key=lambda c: self.demands[c], reverse=True)
+        new = [[] for _ in range(self.num_vehicles)]
+        loads = [0] * self.num_vehicles
+        for c in all_clients:
+            placed = False
+            for i in range(self.num_vehicles):
+                if loads[i] + self.demands[c] <= self.capacity:
+                    new[i].append(c); loads[i] += self.demands[c]; placed = True; break
+            if not placed:
+                i = min(range(self.num_vehicles), key=lambda x: loads[x])
+                new[i].append(c); loads[i] += self.demands[c]
+        return new
+
+    # -------------------- Voisinage strictement faisable --------------------
+    def _neighbors(self, sol, deadline):
+        cands = []
+        sol_list = [list(r) for r in sol]
+        K = len(sol_list)
+        loads = [sum(self.demands[c] for c in r) for r in sol_list]
+
+        # Relocation
+        for src in range(K):
+            if time.time() > deadline: break
+            for idx in range(len(sol_list[src])):
+                if time.time() > deadline or len(cands) >= 400: break
+                client = sol_list[src][idx]
+                for dst in range(K):
+                    if dst == src: continue
+                    if loads[dst] + self.demands[client] > self.capacity: continue
+                    bp, bi = 0, float('inf')
+                    for pos in range(len(sol_list[dst])+1):
+                        prev = sol_list[dst][pos-1] if pos>0 else 0
+                        nxt  = sol_list[dst][pos]   if pos<len(sol_list[dst]) else 0
+                        inc  = self.D[prev,client] + self.D[client,nxt] - self.D[prev,nxt]
+                        if inc < bi: bi, bp = inc, pos
+                    nb = [r[:] for r in sol_list]
+                    nb[src] = sol_list[src][:idx] + sol_list[src][idx+1:]
+                    nb[dst] = sol_list[dst][:bp] + [client] + sol_list[dst][bp:]
+                    cands.append(self._freeze(nb))
+                    if len(cands) >= 400: break
+                if len(cands) >= 400: break
+            if len(cands) >= 400: break
+
+        # 2-opt intra
+        for r in range(K):
+            if time.time() > deadline or len(cands) >= 400: break
+            route = sol_list[r]
+            for i in range(1, len(route)-1):
+                for j in range(i+1, len(route)):
+                    if j-i == 1: continue
+                    nb = [r[:] for r in sol_list]
+                    nb[r] = route[:i] + route[i:j][::-1] + route[j:]
+                    cands.append(self._freeze(nb))
+                    if len(cands) >= 400: break
+                if len(cands) >= 400: break
+            if len(cands) >= 400: break
+
+        # Swap inter-routes
+        for i in range(K):
+            if time.time() > deadline or len(cands) >= 400: break
+            for j in range(i+1, K):
+                if not sol_list[i] or not sol_list[j]: continue
+                for ki in range(min(2, len(sol_list[i]))):
+                    for kj in range(min(2, len(sol_list[j]))):
+                        ci = sol_list[i][ki]; cj = sol_list[j][kj]
+                        new_i = loads[i] - self.demands[ci] + self.demands[cj]
+                        new_j = loads[j] - self.demands[cj] + self.demands[ci]
+                        if new_i > self.capacity or new_j > self.capacity: continue
+                        nb = [r[:] for r in sol_list]
+                        nb[i][ki], nb[j][kj] = nb[j][kj], nb[i][ki]
+                        cands.append(self._freeze(nb))
+                        if len(cands) >= 400: break
+                    if len(cands) >= 400: break
+                if len(cands) >= 400: break
+            if len(cands) >= 400: break
+
+        return cands
+
+    # -------------------- Tabu Search --------------------
+    def tabu_search(self):
+        if self.solution is None:
+            raise ValueError("Solution initiale non définie.")
+        # Assurer faisabilité de la solution initiale
+        if not self._is_feasible(self.solution):
+            self.solution = self._force_feasible_strict(self.solution)
+            self.solution = self._repair_full(self.solution)
+
+        start = time.time()
+        deadline = start + self.max_time
+        current = self._freeze(self.solution)
+        best_sol = current
+        best_cost = total_dist(self._unfreeze(best_sol), self.D)
+
+        tabu_set = set()
+        tabu_q = []
+        tenure = max(7, min(15, self.num_vehicles // 3))
+
+        while time.time() < deadline:
+            nbrs = self._neighbors(self._unfreeze(current), deadline)
+            if not nbrs: break
+
+            bn, bnc = None, float('inf')
+            for nb in nbrs:
+                nb_sol = self._unfreeze(nb)
+                if not self._is_feasible(nb_sol): continue
+                c = total_dist(nb_sol, self.D)
+                if nb in tabu_set and c >= best_cost: continue
+                if c < bnc:
+                    bnc, bn = c, nb
+
+            if bn is None: break
+            if bnc < best_cost:
+                best_sol = bn
+                best_cost = bnc
+
+            tabu_set.add(current); tabu_q.append(current)
+            if len(tabu_q) > tenure:
+                tabu_set.discard(tabu_q.pop(0))
+            current = bn
+
+        final_sol = self._unfreeze(best_sol)
+        if not self._is_feasible(final_sol):
+            final_sol = self._force_feasible_strict(final_sol)
+            final_sol = self._repair_full(final_sol)
+        return final_sol
+
+# =============================================================================
+# PHASE 1 : OPTIMISATION DES STATIQUES
+# =============================================================================
+
+def phase1_optimization(coords, demands, D, capacity, num_vehicles, max_time, seed, clients):
+    xy = np.array([coords[c] for c in clients])
+    km = KMeans(n_clusters=num_vehicles, random_state=seed, n_init=10).fit(xy)
+    routes = [[] for _ in range(num_vehicles)]
+    for idx, lbl in enumerate(km.labels_):
+        routes[lbl].append(clients[idx])
+    # Réparation complète pour garantir faisabilité initiale
+    solver_temp = TabuSolver(coords, demands, D, capacity, num_vehicles, max_time, seed)
+    routes = solver_temp._repair_full(routes)
+    # Tabu Search
+    solver = TabuSolver(coords, demands, D, capacity, num_vehicles, max_time, seed)
+    solver.set_initial_solution(routes)
+    final_routes = solver.tabu_search()
+    cost = total_dist(final_routes, D)
+    feasible = is_feasible(final_routes, demands, capacity)
+    print(f"    Phase1: cost={cost:.0f}, faisable={feasible}")
+    if not feasible:
+        loads = [sum(demands[c] for c in r) for r in final_routes]
+        over = [i for i, l in enumerate(loads) if l > capacity]
+        print(f"      Surcharges routes {over}")
+    return final_routes, cost
+
+# =============================================================================
+# FEATURES ML
+# =============================================================================
+
+def build_features(coords, demands, capacity, client_list, route_assignments,
+                   global_centroid=None):
+    if not client_list:
+        return np.array([]).reshape(0,5), []
+    all_x = [coords[c][0] for c in client_list]
+    all_y = [coords[c][1] for c in client_list]
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    dx = max(x_max - x_min, 1e-9)
+    dy = max(y_max - y_min, 1e-9)
+    if global_centroid is None:
+        global_centroid = np.array([np.mean(all_x), np.mean(all_y)])
+    route_centroids = {}
+    for c, r_idx in zip(client_list, route_assignments):
+        route_centroids.setdefault(r_idx, []).append(coords[c])
+    route_centroids = {r: np.mean(pts, axis=0) for r, pts in route_centroids.items()}
+    X, y = [], []
+    for c, r_idx in zip(client_list, route_assignments):
+        cx, cy = coords[c]
+        f0 = (cx - x_min) / dx
+        f1 = (cy - y_min) / dy
+        f2 = demands[c] / capacity
+        f3 = np.hypot(cx - global_centroid[0], cy - global_centroid[1])
+        rc = route_centroids.get(r_idx, global_centroid)
+        f4 = np.hypot(cx - rc[0], cy - rc[1])
+        X.append([f0, f1, f2, f3, f4])
+        y.append(r_idx)
+    return np.array(X), y
+
+# =============================================================================
+# PHASE 2 : MÉTHODES D'INSERTION
+# =============================================================================
+
+class InsertionBenchmark:
+    def __init__(self, coords, demands, D, capacity,
+                 static_clients, dynamic_clients, initial_routes):
+        self.coords = coords
+        self.demands = demands
+        self.D = D
+        self.capacity = capacity
+        self.static = static_clients
+        self.dynamic = dynamic_clients
+        self.initial_routes = [r[:] for r in initial_routes]
+        self.K = len(initial_routes)
+        if static_clients:
+            self.global_centroid = np.mean([coords[c] for c in static_clients], axis=0)
+        else:
+            self.global_centroid = np.array([0.,0.])
+        self._update_route_centroids(self.initial_routes)
+
+    def _update_route_centroids(self, routes):
+        self.route_centroids = {
+            ri: np.mean([self.coords[c] for c in r], axis=0) if r else self.global_centroid.copy()
+            for ri, r in enumerate(routes)
+        }
+
+    def _fresh(self):
+        return [r[:] for r in self.initial_routes]
+
+    def _loads(self, routes):
+        return [sum(self.demands[c] for c in r) for r in routes]
+
+    def _best_pos(self, route, client):
+        bp, bi = 0, float('inf')
+        n = len(route)
+        for pos in range(n+1):
+            prev = route[pos-1] if pos>0 else 0
+            nxt  = route[pos]   if pos<n else 0
+            inc  = self.D[prev,client] + self.D[client,nxt] - self.D[prev,nxt]
+            if inc < bi:
+                bi, bp = inc, pos
+        return bp, bi
+
+    # Fallback pénalisé (uniquement si aucune route faisable)
+    def _cheapest_fb_penalty(self, routes, loads, client):
+        best_inc = float('inf')
+        best_route = -1
+        best_pos = -1
+        for i, r in enumerate(routes):
+            p, inc = self._best_pos(r, client)
+            new_load = loads[i] + self.demands[client]
+            penalty = max(0, (new_load - self.capacity)) * 1000
+            total = inc + penalty
+            if total < best_inc:
+                best_inc = total
+                best_route = i
+                best_pos = p
+        if best_route != -1:
+            routes[best_route].insert(best_pos, client)
+            loads[best_route] += self.demands[client]
+        return best_route != -1
+
+    # ---------- 1. Random (vraiment aléatoire) ----------
+    def random_insertion(self):
+        routes = self._fresh()
+        loads = self._loads(routes)
+        for c in self.dynamic:
+            feas = [i for i in range(self.K) if loads[i] + self.demands[c] <= self.capacity]
+            if feas:
+                idx = random.choice(feas)
+                p, _ = self._best_pos(routes[idx], c)
+                routes[idx].insert(p, c)
+                loads[idx] += self.demands[c]
+            else:
+                self._cheapest_fb_penalty(routes, loads, c)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        random: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    # ---------- 2. Cheapest (pénalisé) ----------
+    def cheapest_insertion(self):
+        routes = self._fresh()
+        loads = self._loads(routes)
+        for c in self.dynamic:
+            self._cheapest_fb_penalty(routes, loads, c)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        cheapest: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    # ---------- 3. Regret-2 (pénalisé) ----------
+    def regret2_insertion(self):
+        routes = self._fresh()
+        loads = self._loads(routes)
+        remaining = list(self.dynamic)
+        while remaining:
+            best_regret = -float('inf')
+            best_client = None
+            best_route_idx = -1
+            best_pos = -1
+            progress = False
+            for client in remaining:
+                candidates = []
+                for i, r in enumerate(routes):
+                    p, inc = self._best_pos(r, client)
+                    new_load = loads[i] + self.demands[client]
+                    penalty = max(0, (new_load - self.capacity)) * 1000
+                    total = inc + penalty
+                    candidates.append((total, i, p))
+                if not candidates:
+                    continue
+                progress = True
+                candidates.sort(key=lambda x: x[0])
+                regret = candidates[1][0] - candidates[0][0] if len(candidates) >= 2 else 0.0
+                if regret > best_regret:
+                    best_regret = regret
+                    best_client = client
+                    best_route_idx, best_pos = candidates[0][1], candidates[0][2]
+            if best_client is None or not progress:
+                break
+            routes[best_route_idx].insert(best_pos, best_client)
+            loads[best_route_idx] += self.demands[best_client]
+            remaining.remove(best_client)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        regret2: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    # ---------- 4. Regret-3 (pénalisé) ----------
+    def regret3_insertion(self):
+        routes = self._fresh()
+        loads = self._loads(routes)
+        remaining = list(self.dynamic)
+        while remaining:
+            best_regret = -float('inf')
+            best_client = None
+            best_route_idx = -1
+            best_pos = -1
+            progress = False
+            for client in remaining:
+                candidates = []
+                for i, r in enumerate(routes):
+                    p, inc = self._best_pos(r, client)
+                    new_load = loads[i] + self.demands[client]
+                    penalty = max(0, (new_load - self.capacity)) * 1000
+                    total = inc + penalty
+                    candidates.append((total, i, p))
+                if not candidates:
+                    continue
+                progress = True
+                candidates.sort(key=lambda x: x[0])
+                if len(candidates) >= 3:
+                    regret = (candidates[1][0] + candidates[2][0])/2.0 - candidates[0][0]
+                elif len(candidates) == 2:
+                    regret = candidates[1][0] - candidates[0][0]
+                else:
+                    regret = 0.0
+                if regret > best_regret:
+                    best_regret = regret
+                    best_client = client
+                    best_route_idx, best_pos = candidates[0][1], candidates[0][2]
+            if best_client is None or not progress:
+                break
+            routes[best_route_idx].insert(best_pos, best_client)
+            loads[best_route_idx] += self.demands[best_client]
+            remaining.remove(best_client)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        regret3: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    # ---------- 5. k-NN (pondéré par capacité restante) ----------
+    def knn_insertion(self, k=5):
+        routes = self._fresh()
+        loads = self._loads(routes)
+        if not self.static:
+            return self.cheapest_insertion()
+        sxy = np.array([self.coords[c] for c in self.static])
+        nbrs = NearestNeighbors(n_neighbors=min(k, len(sxy)), algorithm='ball_tree').fit(sxy)
+        for client in self.dynamic:
+            _, idxs = nbrs.kneighbors(np.array(self.coords[client]).reshape(1,-1))
+            scores = defaultdict(float)
+            for idx in idxs[0]:
+                sc = self.static[idx]
+                for ri, route in enumerate(routes):
+                    if sc in route:
+                        rem = self.capacity - loads[ri]
+                        scores[ri] += rem
+                        break
+            inserted = False
+            if scores:
+                target = max(scores, key=scores.get)
+                if loads[target] + self.demands[client] <= self.capacity:
+                    p, _ = self._best_pos(routes[target], client)
+                    routes[target].insert(p, client)
+                    loads[target] += self.demands[client]
+                    inserted = True
+            if not inserted:
+                self._cheapest_fb_penalty(routes, loads, client)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        knn: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    # ---------- Classifieurs (SVM, Random Forest, Gradient Boosting) ----------
+    def _fit_classifier(self, clf_class, **kwargs):
+        client_list, route_assign = [], []
+        for ri, route in enumerate(self.initial_routes):
+            for c in route:
+                client_list.append(c); route_assign.append(ri)
+        if len(set(route_assign)) < 2:
+            return None, None, None
+        X, y = build_features(self.coords, self.demands, self.capacity,
+                              client_list, route_assign, self.global_centroid)
+        clf = clf_class(**kwargs)
+        clf.fit(X, y)
+        return clf, client_list, route_assign
+
+    def _predict_and_insert(self, clf, routes, loads, client):
+        cx, cy = self.coords[client]
+        f2 = self.demands[client] / self.capacity
+        f3 = np.hypot(cx - self.global_centroid[0], cy - self.global_centroid[1])
+        if self.route_centroids:
+            f4 = min(np.hypot(cx - rc[0], cy - rc[1]) for rc in self.route_centroids.values())
+        else:
+            f4 = 0.0
+        pred = int(clf.predict([[cx, cy, f2, f3, f4]])[0])
+        if 0 <= pred < self.K and loads[pred] + self.demands[client] <= self.capacity:
+            p, _ = self._best_pos(routes[pred], client)
+            routes[pred].insert(p, client)
+            loads[pred] += self.demands[client]
+        else:
+            self._cheapest_fb_penalty(routes, loads, client)
+
+    def svm_insertion(self):
+        routes = self._fresh(); loads = self._loads(routes)
+        clf, _, _ = self._fit_classifier(SVC, kernel='rbf', gamma='scale', C=1.0, random_state=42)
+        if clf is None:
+            return self.cheapest_insertion()
+        for c in self.dynamic:
+            self._predict_and_insert(clf, routes, loads, c)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        svm: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    def kmeans_classifier_insertion(self):
+        routes = self._fresh(); loads = self._loads(routes)
+        centroids = np.array([
+            np.mean([self.coords[c] for c in r], axis=0) if r else self.global_centroid.copy()
+            for r in self.initial_routes
+        ])
+        for client in self.dynamic:
+            order = np.argsort(np.linalg.norm(centroids - np.array(self.coords[client]), axis=1))
+            inserted = False
+            for target in order:
+                if loads[target] + self.demands[client] <= self.capacity:
+                    p, _ = self._best_pos(routes[target], client)
+                    routes[target].insert(p, client)
+                    loads[target] += self.demands[client]
+                    inserted = True
+                    break
+            if not inserted:
+                self._cheapest_fb_penalty(routes, loads, client)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        kmeans_classifier: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    def random_forest_insertion(self, n_estimators=100):
+        routes = self._fresh(); loads = self._loads(routes)
+        clf, _, _ = self._fit_classifier(RandomForestClassifier,
+                                         n_estimators=n_estimators,
+                                         random_state=42, n_jobs=1)
+        if clf is None:
+            return self.cheapest_insertion()
+        for c in self.dynamic:
+            self._predict_and_insert(clf, routes, loads, c)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        random_forest: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+    def gradient_boosting_insertion(self, n_estimators=None, max_depth=None, learning_rate=0.1):
+        routes = self._fresh(); loads = self._loads(routes)
+        centroids = []
+        for route in self.initial_routes:
+            if route:
+                cx = np.mean([self.coords[c][0] for c in route])
+                cy = np.mean([self.coords[c][1] for c in route])
+            else:
+                cx, cy = 0.0, 0.0
+            centroids.append((cx, cy))
+        dist_matrix = {
+            c: [np.hypot(self.coords[c][0]-cx, self.coords[c][1]-cy) for (cx,cy) in centroids]
+            for c in range(len(self.coords))
+        }
+        def make_features(idx):
+            x, y = self.coords[idx]
+            return [x, y, self.demands[idx]] + dist_matrix[idx]
+        X_train, y_train = [], []
+        for ri, route in enumerate(self.initial_routes):
+            for c in route:
+                X_train.append(make_features(c)); y_train.append(ri)
+        if len(X_train) == 0 or len(set(y_train)) < 2:
+            return self.cheapest_insertion()
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y_train)
+        n_c = len(le.classes_)
+        n_s = len(X_train)
+        if n_estimators is None or max_depth is None:
+            if n_c > 20 or (n_s / n_c) < 8:
+                _n_est = n_estimators if n_estimators is not None else 50
+                _depth = max_depth if max_depth is not None else 3
+            else:
+                _n_est = n_estimators if n_estimators is not None else 100
+                _depth = max_depth if max_depth is not None else 5
+        else:
+            _n_est, _depth = n_estimators, max_depth
+        model = xgb.XGBClassifier(n_estimators=_n_est, max_depth=_depth,
+                                  learning_rate=learning_rate, random_state=42,
+                                  verbosity=0, n_jobs=1)
+        model.fit(X_train, y_enc)
+        for client in self.dynamic:
+            pred_enc = int(model.predict([make_features(client)])[0])
+            pred = int(le.inverse_transform([pred_enc])[0])
+            if 0 <= pred < self.K and loads[pred] + self.demands[client] <= self.capacity:
+                pos, _ = self._best_pos(routes[pred], client)
+                routes[pred].insert(pos, client)
+                loads[pred] += self.demands[client]
+            else:
+                self._cheapest_fb_penalty(routes, loads, client)
+        inserted = sum(len(r) for r in routes) - len(self.static)
+        print(f"        gradient_boosting: insérés {inserted}/{len(self.dynamic)} clients")
+        return routes
+
+def run_insertion(bench, mkey, k=5):
+    d = {
+        "random": bench.random_insertion,
+        "cheapest": bench.cheapest_insertion,
+        "regret2": bench.regret2_insertion,
+        "regret3": bench.regret3_insertion,
+        "knn": lambda: bench.knn_insertion(k=k),
+        "svm": bench.svm_insertion,
+        "kmeans_classifier": bench.kmeans_classifier_insertion,
+        "random_forest": bench.random_forest_insertion,
+        "gradient_boosting": bench.gradient_boosting_insertion,
+    }
+    return d[mkey]()
+
+# =============================================================================
+# ANALYSE DES RÉSULTATS (CORRIGÉE)
+# =============================================================================
+
+def analyse_results():
+    if not os.path.exists(OUTPUT_CSV):
+        print("Aucun fichier de résultats à analyser.")
+        return
+    data = defaultdict(list)
+    times = defaultdict(list)
+    with open(OUTPUT_CSV, newline='') as f:
+        for row in csv.DictReader(f):
+            key = (row['instance'], row['insertion_method'])
+            data[key].append(float(row['cost_after_reopt']))
+            times[row['insertion_method']].append(float(row['insertion_time_s']))
+
+    methods = [m for _, m in INSERTION_METHODS]
+    instances = set(i for i,_ in data.keys())
+    instances = sorted(instances)
+
+    print("\n" + "="*110)
+    print("TABLEAU RÉCAPITULATIF – COÛT FINAL MOYEN (30 runs)")
+    print("="*110)
+    hdr = f"{'Instance':<18}" + "".join(f"{m:>16}" for m in methods)
+    print(hdr)
+    for inst in instances:
+        line = f"{inst:<18}"
+        for m in methods:
+            vals = data[(inst, m)]
+            line += f"{np.mean(vals):>16.2f}" if vals else f"{'N/A':>16}"
+        print(line)
+
+    print("\n=== RANGS MOYENS (coût final) ===")
+    from scipy.stats import rankdata
+    ranks = defaultdict(list)
+    for inst in instances:
+        vals = [np.mean(data[(inst, m)]) if data[(inst, m)] else float('inf') for m in methods]
+        for m, r in zip(methods, rankdata(vals)):
+            ranks[m].append(r)
+    for m in methods:
+        print(f"  {m:<26}: avg rank = {np.mean(ranks[m]):.2f}  "
+              f"wins = {sum(1 for r in ranks[m] if r==1.0)}/{len(instances)}")
+
+    print("\n=== TEMPS D'INSERTION MOYEN (secondes) ===")
+    for m in methods:
+        t = times[m]
+        if t:
+            print(f"  {m:<26}: {np.mean(t):.6f} s ± {np.std(t):.6f}")
+
+    print("\n=== COMPROMIS COÛT/TEMPS (score normalisé) ===")
+    # CORRECTION : on prend la moyenne des moyennes par instance
+    cost_means = {}
+    for m in methods:
+        instance_means = [np.mean(data[(inst, m)]) for inst in instances if data[(inst, m)]]
+        cost_means[m] = np.mean(instance_means) if instance_means else 0.0
+    time_means = {m: np.mean(times[m]) for m in methods}
+    cost_min, cost_max = min(cost_means.values()), max(cost_means.values())
+    time_min, time_max = min(time_means.values()), max(time_means.values())
+    compromise = {}
+    for m in methods:
+        norm_cost = (cost_means[m] - cost_min) / (cost_max - cost_min) if cost_max > cost_min else 0
+        norm_time = (time_means[m] - time_min) / (time_max - time_min) if time_max > time_min else 0
+        compromise[m] = (norm_cost + norm_time) / 2
+    sorted_comp = sorted(compromise.items(), key=lambda x: x[1])
+    for m, score in sorted_comp:
+        print(f"    {m:<26}: score = {score:.4f}")
+
+# =============================================================================
+# BOUCLE PRINCIPALE
+# =============================================================================
+
+def main():
+    fieldnames = [
+        'instance', 'run', 'seed', 'n_static', 'n_dynamic',
+        'phase1_cost', 'phase1_time_s',
+        'insertion_method', 'cost_after_insertion', 'insertion_time_s',
+        'cost_after_reopt', 'reopt_time_s', 'feasible'
+    ]
+    with open(OUTPUT_CSV, 'w', newline='') as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    for filename in INSTANCE_FILES:
+        file_path = os.path.join(INSTANCE_DIR, filename)
+        if not os.path.exists(file_path):
+            print(f"Fichier {file_path} introuvable, instance ignorée.")
+            continue
+        try:
+            coords, demands, dim, capacity, n_veh = load_instance(file_path)
+        except Exception as e:
+            print(f"Erreur chargement {filename}: {e}")
+            continue
+
+        D = precompute_distances(coords)
+        print(f"\n{'='*60}\n{filename} | dim={dim} capacité={capacity} K={n_veh}")
+
+        # Séparation 70/30
+        np.random.seed(42)
+        all_c = list(range(1, dim))
+        np.random.shuffle(all_c)
+        split = int(0.7 * len(all_c))
+        static_c = sorted(all_c[:split])
+        dynamic_c = sorted(all_c[split:])
+        print(f"  statiques={len(static_c)} dynamiques={len(dynamic_c)}")
+        total_demand_static = sum(demands[c] for c in static_c)
+        total_cap = capacity * n_veh
+        print(f"  Demande statique totale: {total_demand_static}, Capacité totale: {total_cap}")
+        if total_demand_static > total_cap:
+            print("  ⚠️ Instance infaisable (demande statique > capacité totale). Ignorée.")
+            continue
+
+        for ri, seed in enumerate(SEEDS):
+            print(f"\nRun {ri+1}/{N_RUNS} (seed={seed})")
+            # Phase 1
+            t0 = time.time()
+            init_routes, phase1_cost = phase1_optimization(
+                coords, demands, D, capacity, n_veh, MAX_TIME_TABU, seed, static_c)
+            phase1_time = time.time() - t0
+            print(f"  Phase1 : cost={phase1_cost:.0f} time={phase1_time:.1f}s")
+
+            for mkey, mname in INSERTION_METHODS:
+                bench = InsertionBenchmark(coords, demands, D, capacity, static_c, dynamic_c, init_routes)
+                t1 = time.time()
+                routes_after_insert = run_insertion(bench, mkey, KNN_K)
+                ins_time = time.time() - t1
+                cost_after_insert = total_dist(routes_after_insert, D)
+
+                # Ré-optimisation (sans _reduce_overload)
+                solver = TabuSolver(coords, demands, D, capacity, n_veh, MAX_TIME_TABU, seed)
+                solver.set_initial_solution(routes_after_insert)
+                t2 = time.time()
+                final_routes = solver.tabu_search()
+                reopt_time = time.time() - t2
+                cost_after_reopt = total_dist(final_routes, D)
+                feasible = is_feasible(final_routes, demands, capacity)
+
+                row = {
+                    "instance": filename,
+                    "run": ri+1,
+                    "seed": seed,
+                    "n_static": len(static_c),
+                    "n_dynamic": len(dynamic_c),
+                    "phase1_cost": round(phase1_cost, 2),
+                    "phase1_time_s": round(phase1_time, 2),
+                    "insertion_method": mname,
+                    "cost_after_insertion": round(cost_after_insert, 2),
+                    "insertion_time_s": round(ins_time, 4),
+                    "cost_after_reopt": round(cost_after_reopt, 2),
+                    "reopt_time_s": round(reopt_time, 2),
+                    "feasible": int(feasible)
+                }
+                with open(OUTPUT_CSV, 'a', newline='') as f:
+                    csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
+                print(f"    {mname:<22} after_insert={cost_after_insert:.0f} after_reopt={cost_after_reopt:.0f} feasible={feasible}")
+
+    print(f"\nBenchmark principal terminé → {OUTPUT_CSV}")
+    analyse_results()
+
+if __name__ == '__main__':
+    main()
